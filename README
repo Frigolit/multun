@@ -1,0 +1,21 @@
+Multi-stream TCP-connection Tunnler
+Copyright (C) 2014 Pontus Rodling - http://frigolit.net
+
+This is a simple TCP tunneling program consisting of a server and client part.
+A connection is split up into multiple streams to help speed up certain types
+of traffic over high-latency links.
+
++---------------+       +------------+
+| Local program | <---> |   multun   |
++---------------+       +------------+
+                          ^  ^  ^  ^
+                          |  |  |  |
+                          |  |  |  |
+                      ~~~~~~~~~~~~~~~~~~
+                          |  |  |  |
+                          |  |  |  |
+                          v  v  v  v
+                        +------------+       +----------------+
+                        |   multund  | <---> | Remote program |
+                        +------------+       +----------------+
+
