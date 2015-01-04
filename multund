@@ -1,0 +1,347 @@
+#!/usr/bin/env pike
+
+#define PKT_SEQ_LENGTH 16777216
+
+constant max_conns = 5;
+constant pingtime = 120;
+
+Stdio.Port port;
+
+string dsthost;
+int    dstport;
+
+mapping sessions = ([ ]);
+
+int connection_counter = 0;
+
+int main(int argc, array argv) {
+	if (argc != 4) {
+		werror("Arguments: <srcport> <dsthost> <dstport>\n");
+		return 1;
+	}
+
+	string bindhost = "0.0.0.0";
+	int    srcport  = (int)argv[1];
+	       dsthost  =      argv[2];
+	       dstport  = (int)argv[3];
+
+	write("Starting listener on %s:%d...\n", bindhost, srcport);
+	port = Stdio.Port(srcport, cb_accept, bindhost);
+
+	return -1;
+}
+
+void cb_accept() {
+	CConnection(port->accept());
+}
+
+class CConnection {
+	private int con_id;
+
+	Stdio.File sock;
+	CSession session;
+
+	string ip;
+
+	private int pingok = 1;
+
+	private string sendbuf = "";
+	private string recvbuf = "";
+
+	mixed _sprintf(mixed ... args) { return "CConnection(" + con_id + ")"; }
+
+	void create(Stdio.File s) {
+		con_id = connection_counter++;
+
+		sock = s;
+		sock->set_nonblocking(cb_read, cb_write, cb_close);
+		sock->set_buffer(256 * 1024);
+
+		ip = (sock->query_address() / " ")[0];
+		write("%O: Incoming connection from %s\n", this, ip);
+
+		call_out(ping, pingtime);
+	}
+
+	void ping() {
+		if (pingok) {
+			pingok = 0;
+			send_ctl(([ "cmd": "ping" ]));
+			call_out(ping, pingtime);
+		}
+		else {
+			send_ctl(([ "cmd": "tunnel_ping_timeout" ]));
+			close();
+		}
+	}
+
+	void cb_read(int a, string d) {
+		if (!recvbuf) return;
+		recvbuf += d;
+
+		while (recvbuf && sizeof(recvbuf) >= 3) {
+			int n = recvbuf[0];
+			int s = (recvbuf[1] << 8) | recvbuf[2];
+
+			if (sizeof(recvbuf) >= 3 + s) {
+				string d = recvbuf[3..s + 2];
+				recvbuf = recvbuf[s + 3..];
+
+				mixed err = catch {
+					if (n == 0) {
+						mapping x = Standards.JSON.decode(d);
+
+						write("%O <- Command: %s\n", this, x->cmd);
+
+						if (x->cmd == "ping") {
+							send_ctl(([ "cmd": "pong" ]));
+						}
+						else if (x->cmd == "pong") {
+							pingok = 1;
+						}
+						else if (x->cmd == "new_session") {
+							if (session) {
+								write("%O: ERROR: Session already assigned!\n", this);
+								send_ctl(([ "cmd": "protocol_error" ]));
+								close();
+							}
+							else {
+								session = CSession(this);
+							}
+						}
+						else if (x->cmd == "join_session") {
+							if (sessions[x->id]) {
+								if (sessions[x->id]->ctlcon->ip == ip) {
+									send_ctl(([ "cmd": "joined" ]));
+									session = sessions[x->id];
+									session->cons += ({ this });
+								}
+								else write("%O: Session IP mismatch (expected %s, got %s)\n", this, sessions[x->id]->ctlcon->ip, ip);
+							}
+							else {
+								write("%O: Invalid session %s\n", this, String.string2hex(x->id || ""));
+							}
+						}
+						else if (x->cmd == "pkt_seq_wrap") {
+							if (session && session->ready) {
+								
+							}
+						}
+						else if (x->cmd == "error" || x->cmd == "protocol_error") {
+							write("%O: Tunnel client sent an error - Disconnecting...\n", this);
+							close();
+						}
+					}
+					else if (n == 1) {
+						if (session && session->ready) {
+							int pktidx = (d[0] << 16) | (d[1] << 8) | d[2];
+							string pktdata = d[3..];
+
+							session->recv_pkt(pktidx, pktdata);
+						}
+						else {
+							write("%O: ERROR: Tunnel client sending data when session isn't ready!", this);
+							send_ctl(([ "cmd": "protocol_error" ]));
+							close();
+						}
+					}
+				};
+
+				if (err) {
+					werror(describe_backtrace(err));
+					send_ctl(([ "cmd": "protocol_error" ]));
+					close();
+					return;
+				}
+			}
+			else return;
+		}
+	}
+
+	void cb_write() {
+		if (sizeof(sendbuf)) sendbuf = sendbuf[sock->write(sendbuf)..];
+	}
+
+	void cb_close() {
+		close();
+	}
+
+	void close() {
+		if (!sock) return;
+
+		remove_call_out(ping);
+
+		recvbuf = UNDEFINED;
+		sendbuf = UNDEFINED;
+
+		if (sock) {
+			sock->close();
+			sock = UNDEFINED;
+		}
+
+		if (session) {
+			if (session->ctlcon && session->ctlcon != this) {
+				session->ctlcon->send_ctl(([ "cmd": "tunnel_connection_error" ]));
+			}
+
+			session->ctlcon = UNDEFINED;
+			session->close();
+			session = UNDEFINED;
+		}
+	}
+
+	void send(int n, string d) {
+		if (sizeof(d) > 65535) throw(({ "Packet is too big (larger than 65535 bytes)\n", backtrace() }));
+		string x = sprintf("%c%2c", n, sizeof(d)) + d;
+
+		if (sizeof(sendbuf)) sendbuf += x;
+		else sendbuf = x[sock->write(x)..];
+	}
+
+	void send_ctl(mapping m) {
+		send(0, Standards.JSON.encode(m));
+	}
+
+	void send_pkt(string data, int pkt_idx) {
+		send(1, sprintf("%3c", pkt_idx) + data);
+	}
+}
+
+class CSession {
+	string id;
+
+	array(CConnection) cons;
+	CConnection ctlcon;
+	Stdio.File outsock;
+
+	int ready;
+
+	string sendbuf = "";
+	array pkts = ({ });
+	int recv_next_pkt_idx = 0;
+	int send_next_pkt_idx = 0;
+
+	string send_wrapqueue = "";
+
+	void create(CConnection con) {
+		id = random_string(32);
+
+		cons = ({ con });
+		ctlcon = con;
+
+		outsock = Stdio.File();
+		outsock->async_connect(dsthost, dstport, cb_connect);
+
+		call_out(cb_timeout, 30);
+	}
+
+	void close() {
+		outsock->close();
+		sendbuf = UNDEFINED;
+		pkts = UNDEFINED;
+		send_wrapqueue = UNDEFINED;
+		ctlcon = UNDEFINED;
+
+		foreach (cons, CConnection c) {
+			c->close();
+		}
+	}
+
+	void cb_timeout() {
+		ctlcon->send_ctl(([ "cmd": "timeout" ]));
+		ctlcon->close();
+	}
+
+	void cb_connect(int r) {
+		if (r) {
+			remove_call_out(cb_timeout);
+
+			sessions[id] = this;
+			ready = 1;
+			write("Local endpoint connected!\n");
+			ctlcon->send_ctl(([ "cmd": "connected", "id": id ]));
+			outsock->set_nonblocking(cb_read, cb_write, cb_close);
+		}
+		else {
+			write("Local endpoint connection failed!\n");
+			ctlcon->send_ctl(([ "cmd": "error" ]));
+			ctlcon->close();
+		}
+	}
+
+	void cb_read(int a, string d) {
+		if (sizeof(d) > 65500) {
+			while (sizeof(d)) {
+				if (send_next_pkt_idx == PKT_SEQ_LENGTH) {
+					send_wrapqueue += d;
+				}
+				else {
+					random(cons)->send_pkt(d[0..65499], send_next_pkt_idx++);
+					d = d[65500..];
+				}
+			}
+		}
+		else {
+			if (send_next_pkt_idx == PKT_SEQ_LENGTH) {
+				send_wrapqueue += d;
+			}
+			else {
+				random(cons)->send_pkt(d, send_next_pkt_idx++);
+			}
+		}
+	}
+
+	void cb_write() {
+		if (sizeof(sendbuf)) sendbuf = sendbuf[outsock->write(sendbuf)..];
+	}
+
+	void cb_close() {
+		ctlcon->send_ctl(([ "cmd": "disconnected" ]));
+		ctlcon->close();
+	}
+
+	void send(string d) {
+		if (sizeof(sendbuf)) sendbuf += d;
+		else sendbuf = d[outsock->write(d)..];
+	}
+
+	void recv_pkt(int idx, string data) {
+		if (idx == recv_next_pkt_idx) {
+			// This is the next packet in the sequence, send it immediately
+			send(data);
+
+			// Increase packet counter
+			recv_next_pkt_idx++;
+			if (recv_next_pkt_idx == PKT_SEQ_LENGTH) {
+				recv_next_pkt_idx = 0;
+				ctlcon->send_ctl(([ "cmd": "pkt_seq_wrap" ]));
+				return;
+			}
+
+			// Check queue
+			if (sizeof(pkts)) {
+				while (sizeof(pkts) && pkts[0]->idx == recv_next_pkt_idx) {
+					send(pkts[0]->data);
+					pkts = pkts[1..];
+
+					recv_next_pkt_idx++;
+					if (recv_next_pkt_idx == PKT_SEQ_LENGTH) {
+						recv_next_pkt_idx = 0;
+						ctlcon->send_ctl(([ "cmd": "pkt_seq_wrap" ]));
+						return;
+					}
+				}
+			}
+		}
+		else {
+			// Insert packet in queue
+			pkts += ({ ([ "idx": idx, "data": data ]) });
+			//write("packet queue size = %d\n", sizeof(pkts));
+
+			if (sizeof(pkts) > 1) {
+				sort(pkts->idx, pkts);
+			}
+		}
+	}
+}
+
